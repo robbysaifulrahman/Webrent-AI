@@ -1,0 +1,329 @@
+openapi: 3.1.0
+info:
+  title: WebRent AI Office - Integration API (Phase A-H)
+  version: 0.5.0
+  description: >
+    Phase A-H EKSEKUSI. Semua respons memakai envelope
+    { success, data|error, meta.request_id } dan header X-Request-Id.
+    Phase C: driver PostgreSQL. Phase D: event bus. Phase E: realtime SSE.
+    Phase F: Raven (HMAC service-to-service). Phase G: Telegram webhook +
+    command engine. Phase H: mode LIVE/DEMO jujur (LIVE butuh backend
+    bersama). Service tanpa env → DISABLED/DISCONNECTED (tidak pernah fake).
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: health
+  - name: system
+  - name: office
+  - name: events
+  - name: integrations
+  - name: dev
+components:
+  schemas:
+    Meta:
+      type: object
+      required: [request_id, timestamp]
+      properties:
+        request_id:
+          type: string
+          example: req_0f3d2a1c-8b7e-4c1a-9d2e-6f5a4b3c2d1e
+        timestamp:
+          type: string
+          format: date-time
+    Envelope:
+      type: object
+      required: [success, data, meta]
+      properties:
+        success:
+          type: boolean
+          const: true
+        data:
+          type: object
+        meta:
+          $ref: '#/components/schemas/Meta'
+    ErrorEnvelope:
+      type: object
+      required: [success, error, meta]
+      properties:
+        success:
+          type: boolean
+          const: false
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              example: NOT_READY
+            message:
+              type: string
+        meta:
+          $ref: '#/components/schemas/Meta'
+    Health:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+        storage:
+          type: object
+          properties:
+            driver:
+              type: string
+              enum: [kv, file]
+  responses:
+    Ok:
+      description: OK (envelope sukses)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Envelope'
+    Error:
+      description: Error (envelope gagal)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+paths:
+  /api/v1/health:
+    get:
+      tags: [health]
+      summary: Health check gabungan
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/health/live:
+    get:
+      tags: [health]
+      summary: Liveness probe (selalu 200)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/health/ready:
+    get:
+      tags: [health]
+      summary: Readiness probe (snapshot state dapat dimuat)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/system/status:
+    get:
+      tags: [system]
+      summary: Status sistem (layout 34x28, LLM configured, driver storage)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/office/state:
+    get:
+      tags: [office]
+      summary: Snapshot state kantor (read-only, sumber = /api/state)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/events:
+    get:
+      tags: [events]
+      summary: >
+        Daftar event terakhir (urut lama->baru) - sumber sinkronisasi ulang
+        klien setelah reconnect (Section 35/56).
+      parameters:
+        - name: since
+          in: query
+          required: false
+          description: Ambil event dengan id urutan > nilai ini.
+          schema:
+            type: integer
+        - name: type
+          in: query
+          required: false
+          description: Filter tipe event (mis. SECURITY_ALERT, TASK_CREATED).
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/events/stream:
+    get:
+      tags: [events]
+      summary: >
+        Realtime stream (Server-Sent Events) - Phase E. Transport Vercel-safe;
+        frame: ready/office-event/heartbeat (berisi server_time, jam kantor
+        bersumber server, Section 17). Di VPS nanti digantikan native WS
+        wss://api.webrent.id/ws/office dengan kontrak frame yang sama.
+      responses:
+        '200':
+          description: Stream SSE (text/event-stream, tak berujung sampai client abort).
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/v1/integrations:
+    get:
+      tags: [integrations]
+      summary: Integration registry (Section 24) + mode kantor (LIVE/DEMO)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/integrations/raven/register:
+    post:
+      tags: [integrations]
+      summary: Registrasi service Raven (HMAC + anti-replay; 503 bila disabled)
+      security: [{ ravenHmac: [] }]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '401':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/integrations/raven/heartbeat:
+    post:
+      tags: [integrations]
+      summary: Heartbeat Raven (kadaluarsa → DISCONNECTED, Section 55)
+      security: [{ ravenHmac: [] }]
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '401':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/integrations/raven/events:
+    post:
+      tags: [integrations]
+      summary: >
+        Ingest event keamanan (Section 9): autentikasi → idempotency →
+        event bus → incident pipeline (HIGH/CRITICAL) → notifikasi Telegram.
+      security: [{ ravenHmac: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                event:
+                  type: string
+                  example: SECURITY_ALERT
+                severity:
+                  type: string
+                  enum: [LOW, MEDIUM, HIGH, CRITICAL]
+                target:
+                  type: object
+                details:
+                  type: object
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '401':
+          $ref: '#/components/responses/Error'
+        '422':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/integrations/raven/status:
+    get:
+      tags: [integrations]
+      summary: Status Raven efektif (heartbeat TTL)
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+  /api/v1/integrations/raven/tasks:
+    post:
+      tags: [integrations]
+      summary: Raven membuat task tindak lanjut (source=RAVEN)
+      security: [{ ravenHmac: [] }]
+      responses:
+        '201':
+          $ref: '#/components/responses/Ok'
+        '401':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/integrations/raven/tasks/{id}:
+    get:
+      tags: [integrations]
+      summary: Baca task tindak lanjut Raven
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '404':
+          $ref: '#/components/responses/Error'
+  /api/v1/integrations/telegram/webhook:
+    post:
+      tags: [integrations]
+      summary: >
+        Webhook Telegram (Phase G): secret header timing-safe, command
+        engine (baca = chat terdaftar, mutasi = admin), balasan via Bot API.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '400':
+          $ref: '#/components/responses/Error'
+        '403':
+          $ref: '#/components/responses/Error'
+        '503':
+          $ref: '#/components/responses/Error'
+  /api/v1/dev/events/{topic}:
+    post:
+      tags: [dev]
+      summary: Event sink dev/staging (stub, tanpa Raven) — 404 di production
+      parameters:
+        - name: topic
+          in: path
+          required: true
+          schema:
+            type: string
+          example: raven/attendance
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+            minLength: 8
+            maxLength: 128
+      responses:
+        '200':
+          $ref: '#/components/responses/Ok'
+        '400':
+          $ref: '#/components/responses/Error'
+        '404':
+          $ref: '#/components/responses/Error'
+        '409':
+          $ref: '#/components/responses/Error'
